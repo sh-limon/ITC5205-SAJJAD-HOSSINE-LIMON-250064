@@ -1,0 +1,3 @@
+{
+  "body": "{\"bucket\": \"itc5205-yolov5-demo\", \"key\": \"uploads/street_sample.jpg\", \"confidence\": 0.25}"
+}

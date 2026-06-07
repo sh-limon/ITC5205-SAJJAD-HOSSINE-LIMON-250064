@@ -1,0 +1,28 @@
+"""Client test script for the ITC5205 YOLOv5 detection API.
+Set API_URL to the CloudFormation DetectApiUrl output and API_KEY to the value printed by deploy/build_and_deploy.sh.
+"""
+import json
+import os
+import requests
+
+API_URL = os.environ.get("API_URL", "PASTE_CLOUDFORMATION_DetectApiUrl_HERE")
+API_KEY = os.environ.get("API_KEY", "PASTE_DEPLOY_SCRIPT_API_KEY_HERE")
+
+if "PASTE_CLOUDFORMATION" in API_URL:
+    raise SystemExit("Set API_URL to the CloudFormation DetectApiUrl output before testing.")
+if "PASTE_DEPLOY_SCRIPT" in API_KEY:
+    raise SystemExit("Set API_KEY to the value printed by deploy/build_and_deploy.sh before testing.")
+
+payload = {
+    "bucket": os.environ.get("IMAGE_BUCKET", "itc5205-yolov5-demo-20036047"),
+    "key": os.environ.get("IMAGE_KEY", "uploads/street_sample.jpg"),
+    "confidence": float(os.environ.get("CONFIDENCE", "0.25")),
+}
+
+headers = {"x-api-key": API_KEY, "content-type": "application/json"}
+response = requests.post(API_URL, headers=headers, json=payload, timeout=120)
+print(response.status_code)
+try:
+    print(json.dumps(response.json(), indent=2))
+except ValueError:
+    print(response.text)

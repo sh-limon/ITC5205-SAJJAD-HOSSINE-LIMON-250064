@@ -1,0 +1,116 @@
+"""AWS Lambda handler for ITC5205 Assignment 2.
+This implementation downloads an image from S3, performs YOLOv5 object detection,
+and writes the annotated image plus JSON detection result back to S3.
+"""
+import base64
+import io
+import json
+import logging
+import os
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, List
+
+import boto3
+from botocore.exceptions import ClientError
+
+# Heavy imports such as torch, cv2 and PIL must be included in the Lambda container image.
+# The code is written defensively so the deployment error is clear if dependencies are missing.
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+s3 = boto3.client("s3")
+MODEL_NAME = os.getenv("MODEL_NAME", "yolov5s")
+OUTPUT_PREFIX = os.getenv("OUTPUT_PREFIX", "results/")
+DEFAULT_CONFIDENCE = float(os.getenv("DEFAULT_CONFIDENCE", "0.25"))
+_model = None
+
+def load_model():
+    global _model
+    if _model is None:
+        import torch
+        logger.info(json.dumps({"event": "model_load_start", "model": MODEL_NAME}))
+        _model = torch.hub.load("ultralytics/yolov5", MODEL_NAME, pretrained=True)
+        _model.conf = DEFAULT_CONFIDENCE
+        logger.info(json.dumps({"event": "model_load_complete", "model": MODEL_NAME}))
+    return _model
+
+def _response(status_code: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "statusCode": status_code,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps(payload, default=str),
+    }
+
+def _parse_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    body = event.get("body", event)
+    if isinstance(body, str):
+        if event.get("isBase64Encoded"):
+            body = base64.b64decode(body).decode("utf-8")
+        body = json.loads(body)
+    if "bucket" not in body or "key" not in body:
+        raise ValueError("Request must include 'bucket' and 'key'.")
+    return body
+
+def _put_with_retry(bucket: str, key: str, body: bytes, content_type: str, attempts: int = 3) -> None:
+    for attempt in range(1, attempts + 1):
+        try:
+            s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType=content_type)
+            return
+        except ClientError as exc:
+            logger.warning(json.dumps({"event": "s3_put_retry", "attempt": attempt, "key": key, "error": str(exc)}))
+            if attempt == attempts:
+                raise
+            time.sleep(0.25 * attempt)
+
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    started = time.time()
+    try:
+        request = _parse_event(event)
+        bucket = request["bucket"]
+        image_key = request["key"]
+        confidence = float(request.get("confidence", DEFAULT_CONFIDENCE))
+        logger.info(json.dumps({"event": "download", "bucket": bucket, "key": image_key}))
+
+        image_obj = s3.get_object(Bucket=bucket, Key=image_key)
+        image_bytes = image_obj["Body"].read()
+
+        from PIL import Image
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        model = load_model()
+        model.conf = confidence
+        results = model(image)
+        detections: List[Dict[str, Any]] = []
+        for *xyxy, conf, cls in results.xyxy[0].tolist():
+            detections.append({
+                "label": results.names[int(cls)],
+                "confidence": round(float(conf), 4),
+                "bbox_xyxy": [round(float(v), 2) for v in xyxy],
+            })
+
+        rendered = results.render()[0]
+        annotated = Image.fromarray(rendered)
+        out_buffer = io.BytesIO()
+        annotated.save(out_buffer, format="JPEG", quality=92)
+
+        stem = image_key.split("/")[-1].rsplit(".", 1)[0]
+        result_image_key = f"{OUTPUT_PREFIX}{stem}_annotated.jpg"
+        result_json_key = f"{OUTPUT_PREFIX}{stem}_detections.json"
+        result_json = {
+            "source_bucket": bucket,
+            "source_key": image_key,
+            "model": MODEL_NAME,
+            "processed_at": datetime.now(timezone.utc).isoformat(),
+            "object_count": len(detections),
+            "detections": detections,
+            "duration_ms": round((time.time() - started) * 1000, 2),
+        }
+
+        _put_with_retry(bucket, result_image_key, out_buffer.getvalue(), "image/jpeg")
+        _put_with_retry(bucket, result_json_key, json.dumps(result_json, indent=2).encode("utf-8"), "application/json")
+        logger.info(json.dumps({"event": "success", "objects": len(detections), "result_json": result_json_key}))
+        return _response(200, {"status": "success", "annotated_image": result_image_key, "result_json": result_json_key, "detected_objects": detections})
+    except Exception as exc:
+        logger.exception("Object detection request failed")
+        return _response(500, {"status": "error", "message": str(exc)})
